@@ -21,9 +21,9 @@ import numpy as np
 from packaging.version import Version, parse
 
 from .. import PreTrainedModel, PreTrainedTokenizer, TensorType, TFPreTrainedModel, is_torch_available
+from ..file_utils import is_torch_onnx_dict_inputs_support_available
 from ..utils import logging
 from .config import OnnxConfig
-from .utils import flatten_output_collection_property
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -79,44 +79,54 @@ def export(
 
     """
     if not is_torch_available():
-        raise Exception("Cannot convert because PyTorch is not installed. Please install torch first.")
+        raise ImportError("Cannot convert because PyTorch is not installed. Please install torch first.")
 
     import torch
     from torch.onnx import export
 
+    from ..file_utils import torch_version
+
+    if not is_torch_onnx_dict_inputs_support_available():
+        raise AssertionError(f"Unsupported PyTorch version, minimum required is 1.8.0, got: {torch_version}")
+
     logger.info(f"Using framework PyTorch: {torch.__version__}")
-    torch.set_grad_enabled(False)
-    model.config.return_dict = True
+    with torch.no_grad():
+        model.config.return_dict = True
+        model.eval()
 
-    # Check if we need to override certain configuration item
-    if config.values_override is not None:
-        logger.info(f"Overriding {len(config.values_override)} configuration item(s)")
-        for override_config_key, override_config_value in config.values_override.items():
-            logger.info(f"\t- {override_config_key} -> {override_config_value}")
-            setattr(model.config, override_config_key, override_config_value)
+        # Check if we need to override certain configuration item
+        if config.values_override is not None:
+            logger.info(f"Overriding {len(config.values_override)} configuration item(s)")
+            for override_config_key, override_config_value in config.values_override.items():
+                logger.info(f"\t- {override_config_key} -> {override_config_value}")
+                setattr(model.config, override_config_key, override_config_value)
 
-    # Ensure inputs match
-    # TODO: Check when exporting QA we provide "is_pair=True"
-    model_inputs = config.generate_dummy_inputs(tokenizer, framework=TensorType.PYTORCH)
-    inputs_match, matched_inputs = ensure_model_and_config_inputs_match(model, model_inputs.keys())
-    onnx_outputs = list(config.outputs.keys())
+        # Ensure inputs match
+        # TODO: Check when exporting QA we provide "is_pair=True"
+        model_inputs = config.generate_dummy_inputs(tokenizer, framework=TensorType.PYTORCH)
+        inputs_match, matched_inputs = ensure_model_and_config_inputs_match(model, model_inputs.keys())
+        onnx_outputs = list(config.outputs.keys())
 
-    if not inputs_match:
-        raise ValueError("Model and config inputs doesn't match")
+        if not inputs_match:
+            raise ValueError("Model and config inputs doesn't match")
 
-    # export can works with named args but the dict containing named args as to be last element of the args tuple
-    export(
-        model,
-        (model_inputs,),
-        f=output.as_posix(),
-        input_names=list(config.inputs.keys()),
-        output_names=onnx_outputs,
-        dynamic_axes={name: axes for name, axes in chain(config.inputs.items(), config.outputs.items())},
-        do_constant_folding=True,
-        use_external_data_format=config.use_external_data_format(model.num_parameters()),
-        enable_onnx_checker=True,
-        opset_version=opset,
-    )
+        config.patch_ops()
+
+        # export can works with named args but the dict containing named args as to be last element of the args tuple
+        export(
+            model,
+            (model_inputs,),
+            f=output.as_posix(),
+            input_names=list(config.inputs.keys()),
+            output_names=onnx_outputs,
+            dynamic_axes={name: axes for name, axes in chain(config.inputs.items(), config.outputs.items())},
+            do_constant_folding=True,
+            use_external_data_format=config.use_external_data_format(model.num_parameters()),
+            enable_onnx_checker=True,
+            opset_version=opset,
+        )
+
+        config.restore_ops()
 
     return matched_inputs, onnx_outputs
 
@@ -133,6 +143,8 @@ def validate_model_outputs(
 
     logger.info("Validating ONNX model...")
 
+    # TODO: generate inputs with a different batch_size and seq_len that was used for conversion to properly test
+    # dynamic input shapes.
     reference_model_inputs = config.generate_dummy_inputs(tokenizer, framework=TensorType.PYTORCH)
 
     # Create ONNX Runtime session
@@ -145,8 +157,12 @@ def validate_model_outputs(
 
     # We flatten potential collection of outputs (i.e. past_keys) to a flat structure
     for name, value in ref_outputs.items():
+        # Overwriting the output name as "present" since it is the name used for the ONNX outputs
+        # ("past_key_values" being taken for the ONNX inputs)
+        if name == "past_key_values":
+            name = "present"
         if isinstance(value, (list, tuple)):
-            value = flatten_output_collection_property(name, value)
+            value = config.flatten_output_collection_property(name, value)
             ref_outputs_dict.update(value)
         else:
             ref_outputs_dict[name] = value
@@ -155,7 +171,7 @@ def validate_model_outputs(
     onnx_inputs = {}
     for name, value in reference_model_inputs.items():
         if isinstance(value, (list, tuple)):
-            value = flatten_output_collection_property(name, value)
+            value = config.flatten_output_collection_property(name, value)
             onnx_inputs.update({tensor_name: pt_tensor.numpy() for tensor_name, pt_tensor in value.items()})
         else:
             onnx_inputs[name] = value.numpy()
@@ -179,7 +195,7 @@ def validate_model_outputs(
 
     # Check the shape and values match
     for name, ort_value in zip(onnx_named_outputs, onnx_outputs):
-        ref_value = ref_outputs_dict[name].numpy()
+        ref_value = ref_outputs_dict[name].detach().numpy()
         logger.info(f'\t- Validating ONNX Model output "{name}":')
 
         # Shape
@@ -190,7 +206,7 @@ def validate_model_outputs(
                 f"Got {ref_value.shape} (reference) and {ort_value.shape} (ONNX)"
             )
         else:
-            logger.info(f"\t\t-[✓] {ort_value.shape} matchs {ref_value.shape}")
+            logger.info(f"\t\t-[✓] {ort_value.shape} matches {ref_value.shape}")
 
         # Values
         if not np.allclose(ref_value, ort_value, atol=atol):

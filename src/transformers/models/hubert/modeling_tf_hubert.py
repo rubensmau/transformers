@@ -258,7 +258,7 @@ def _compute_mask_indices(
         tf.ones_like(spec_aug_mask_idxs), spec_aug_mask_idxs, spec_aug_mask.shape
     )
 
-    return tf.cast(spec_aug_mask, tf.float32)
+    return spec_aug_mask
 
 
 # Copied from transformers.models.bart.modeling_tf_bart._expand_mask
@@ -1227,13 +1227,6 @@ class TFHubertMainLayer(tf.keras.layers.Layer):
         hidden_states = self.feature_projection(hidden_states, training=inputs["training"])
 
         mask_time_indices = kwargs.get("mask_time_indices", None)
-        if mask_time_indices is not None:  # apply SpecAugment along time axis with given indices
-            hidden_states = tf.where(
-                tf.cast(mask_time_indices[:, :, tf.newaxis], tf.bool),
-                self.masked_spec_embed[tf.newaxis, tf.newaxis, :],
-                hidden_states,
-            )
-
         if inputs["training"]:
             hidden_states = self._mask_hidden_states(hidden_states, mask_time_indices=mask_time_indices)
 

@@ -47,6 +47,15 @@ class BigBirdTokenizerFast:
         requires_backends(cls, ["tokenizers"])
 
 
+class BlenderbotSmallTokenizerFast:
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["tokenizers"])
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        requires_backends(cls, ["tokenizers"])
+
+
 class CamembertTokenizerFast:
     def __init__(self, *args, **kwargs):
         requires_backends(self, ["tokenizers"])
@@ -128,6 +137,15 @@ class ElectraTokenizerFast:
         requires_backends(cls, ["tokenizers"])
 
 
+class FNetTokenizerFast:
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["tokenizers"])
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        requires_backends(cls, ["tokenizers"])
+
+
 class FunnelTokenizerFast:
     def __init__(self, *args, **kwargs):
         requires_backends(self, ["tokenizers"])
@@ -164,6 +182,15 @@ class LayoutLMTokenizerFast:
         requires_backends(cls, ["tokenizers"])
 
 
+class LayoutLMv2TokenizerFast:
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["tokenizers"])
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        requires_backends(cls, ["tokenizers"])
+
+
 class LEDTokenizerFast:
     def __init__(self, *args, **kwargs):
         requires_backends(self, ["tokenizers"])
@@ -191,7 +218,7 @@ class LxmertTokenizerFast:
         requires_backends(cls, ["tokenizers"])
 
 
-class MBart50TokenizerFast:
+class MBartTokenizerFast:
     def __init__(self, *args, **kwargs):
         requires_backends(self, ["tokenizers"])
 
@@ -200,7 +227,7 @@ class MBart50TokenizerFast:
         requires_backends(cls, ["tokenizers"])
 
 
-class MBartTokenizerFast:
+class MBart50TokenizerFast:
     def __init__(self, *args, **kwargs):
         requires_backends(self, ["tokenizers"])
 
@@ -263,6 +290,15 @@ class ReformerTokenizerFast:
         requires_backends(cls, ["tokenizers"])
 
 
+class RemBertTokenizerFast:
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["tokenizers"])
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        requires_backends(cls, ["tokenizers"])
+
+
 class RetriBertTokenizerFast:
     def __init__(self, *args, **kwargs):
         requires_backends(self, ["tokenizers"])
@@ -282,6 +318,15 @@ class RobertaTokenizerFast:
 
 
 class RoFormerTokenizerFast:
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["tokenizers"])
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        requires_backends(cls, ["tokenizers"])
+
+
+class SplinterTokenizerFast:
     def __init__(self, *args, **kwargs):
         requires_backends(self, ["tokenizers"])
 

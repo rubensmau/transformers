@@ -14,12 +14,15 @@
 """
 Integrations with other Python libraries.
 """
+import functools
 import importlib.util
 import numbers
 import os
+import sys
 import tempfile
 from pathlib import Path
 
+from .file_utils import is_datasets_available
 from .utils import logging
 
 
@@ -80,6 +83,10 @@ def is_ray_tune_available():
     return importlib.util.find_spec("ray.tune") is not None
 
 
+def is_sigopt_available():
+    return importlib.util.find_spec("sigopt") is not None
+
+
 def is_azureml_available():
     if importlib.util.find_spec("azureml") is None:
         return False
@@ -114,6 +121,10 @@ def hp_params(trial):
         if isinstance(trial, dict):
             return trial
 
+    if is_sigopt_available():
+        if isinstance(trial, dict):
+            return trial
+
     raise RuntimeError(f"Unknown type for trial {trial.__class__}")
 
 
@@ -122,6 +133,8 @@ def default_hp_search_backend():
         return "optuna"
     elif is_ray_tune_available():
         return "ray"
+    elif is_sigopt_available():
+        return "sigopt"
 
 
 def run_hp_search_optuna(trainer, n_trials: int, direction: str, **kwargs) -> BestRun:
@@ -246,8 +259,34 @@ def run_hp_search_ray(trainer, n_trials: int, direction: str, **kwargs) -> BestR
                 "Trainer `args`.".format(cls=type(kwargs["scheduler"]).__name__)
             )
 
+    trainable = ray.tune.with_parameters(_objective, local_trainer=trainer)
+
+    @functools.wraps(trainable)
+    def dynamic_modules_import_trainable(*args, **kwargs):
+        """
+        Wrapper around ``tune.with_parameters`` to ensure datasets_modules are loaded on each Actor.
+
+        Without this, an ImportError will be thrown. See https://github.com/huggingface/transformers/issues/11565.
+
+        Assumes that ``_objective``, defined above, is a function.
+        """
+        if is_datasets_available():
+            import datasets.load
+
+            dynamic_modules_path = os.path.join(datasets.load.init_dynamic_modules(), "__init__.py")
+            # load dynamic_modules from path
+            spec = importlib.util.spec_from_file_location("datasets_modules", dynamic_modules_path)
+            datasets_modules = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = datasets_modules
+            spec.loader.exec_module(datasets_modules)
+        return trainable(*args, **kwargs)
+
+    # special attr set by tune.with_parameters
+    if hasattr(trainable, "__mixins__"):
+        dynamic_modules_import_trainable.__mixins__ = trainable.__mixins__
+
     analysis = ray.tune.run(
-        ray.tune.with_parameters(_objective, local_trainer=trainer),
+        dynamic_modules_import_trainable,
         config=trainer.hp_space(None),
         num_samples=n_trials,
         **kwargs,
@@ -256,6 +295,45 @@ def run_hp_search_ray(trainer, n_trials: int, direction: str, **kwargs) -> BestR
     best_run = BestRun(best_trial.trial_id, best_trial.last_result["objective"], best_trial.config)
     if _tb_writer is not None:
         trainer.add_callback(_tb_writer)
+    return best_run
+
+
+def run_hp_search_sigopt(trainer, n_trials: int, direction: str, **kwargs) -> BestRun:
+
+    from sigopt import Connection
+
+    conn = Connection()
+    proxies = kwargs.pop("proxies", None)
+    if proxies is not None:
+        conn.set_proxies(proxies)
+
+    experiment = conn.experiments().create(
+        name="huggingface-tune",
+        parameters=trainer.hp_space(None),
+        metrics=[dict(name="objective", objective=direction, strategy="optimize")],
+        parallel_bandwidth=1,
+        observation_budget=n_trials,
+        project="huggingface",
+    )
+    logger.info(f"created experiment: https://app.sigopt.com/experiment/{experiment.id}")
+
+    while experiment.progress.observation_count < experiment.observation_budget:
+        suggestion = conn.experiments(experiment.id).suggestions().create()
+        trainer.objective = None
+        trainer.train(resume_from_checkpoint=None, trial=suggestion)
+        # If there hasn't been any evaluation during the training loop.
+        if getattr(trainer, "objective", None) is None:
+            metrics = trainer.evaluate()
+            trainer.objective = trainer.compute_objective(metrics)
+
+        values = [dict(name="objective", value=trainer.objective)]
+        obs = conn.experiments(experiment.id).observations().create(suggestion=suggestion.id, values=values)
+        logger.info(f"[suggestion_id, observation_id]: [{suggestion.id}, {obs.id}]")
+        experiment = conn.experiments(experiment.id).fetch()
+
+    best = list(conn.experiments(experiment.id).best_assignments().fetch().iterate_pages())[0]
+    best_run = BestRun(best.id, best.value, best.assignments)
+
     return best_run
 
 
@@ -335,7 +413,8 @@ class TensorBoardCallback(TrainerCallback):
             if trial_name is not None:
                 log_dir = os.path.join(args.logging_dir, trial_name)
 
-        self._init_summary_writer(args, log_dir)
+        if self.tb_writer is None:
+            self._init_summary_writer(args, log_dir)
 
         if self.tb_writer is not None:
             self.tb_writer.add_text("args", args.to_json_string())
@@ -372,6 +451,7 @@ class TensorBoardCallback(TrainerCallback):
     def on_train_end(self, args, state, control, **kwargs):
         if self.tb_writer:
             self.tb_writer.close()
+            self.tb_writer = None
 
 
 class WandbCallback(TrainerCallback):
@@ -571,7 +651,7 @@ class AzureMLCallback(TrainerCallback):
             self.azureml_run = Run.get_context()
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        if self.azureml_run:
+        if self.azureml_run and state.is_world_process_zero:
             for k, v in logs.items():
                 if isinstance(v, (int, float)):
                     self.azureml_run.log(k, v, description=k)
@@ -698,6 +778,7 @@ class NeptuneCallback(TrainerCallback):
                 api_token=os.getenv("NEPTUNE_API_TOKEN"),
                 mode=os.getenv("NEPTUNE_CONNECTION_MODE", "async"),
                 name=os.getenv("NEPTUNE_RUN_NAME", None),
+                run=os.getenv("NEPTUNE_RUN_ID", None),
             )
             combined_dict = args.to_dict()
             if hasattr(model, "config") and model.config is not None:
